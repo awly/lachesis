@@ -21,8 +21,8 @@ const (
 var (
 	listenPort   = flag.Int("l", 1111, "port to listen on for inter-node communications")
 	joinAddr     = flag.String("j", "", "address of any existing node to join")
-	pingInterval = flag.Int("i", 2, "inter-node ping interval, seconds")
-	timeout      = flag.Int("t", 2, "communication timeout, seconds")
+	pingInterval = flag.Int("i", 5, "inter-node ping interval, seconds")
+	timeout      = flag.Int("t", 10, "communication timeout, seconds")
 )
 
 type node struct {
