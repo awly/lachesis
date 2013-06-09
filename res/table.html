@@ -1,0 +1,8 @@
+{{range $i, $node := .}}
+<tr>
+	<td>{{$i}}</td>
+	<td>{{$node.TCPAddr}}</td>
+	<td>{{$node.LastSeen.Format "15:04:05"}}</td>
+	<td>{{if $node.Up}}yes{{else}}no{{end}}</td>
+</tr>
+{{end}}

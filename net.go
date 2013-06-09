@@ -2,9 +2,12 @@ package main
 
 import (
 	"encoding/gob"
+	"errors"
 	"flag"
 	"log"
 	"net"
+	"os/exec"
+	"strings"
 	"time"
 )
 
@@ -12,6 +15,7 @@ const (
 	msgPing = iota
 	msgOK
 	msgErr
+	msgExec
 )
 
 var (
@@ -23,13 +27,14 @@ var (
 
 type node struct {
 	*net.TCPAddr
-	lastSeen    time.Time
+	LastSeen    time.Time
 	failedPings int
 	monitoring  bool
 	Up          bool
 }
 
 type message struct {
+	remote     *net.TCPAddr
 	Typ        int8
 	Data       interface{}
 	ListenPort int32
@@ -39,6 +44,8 @@ func netInit() {
 	gob.Register(message{})
 	gob.Register(node{})
 	gob.Register(make(map[string]node))
+	gob.Register(exec.Error{})
+	gob.Register(errors.New(""))
 }
 
 func joinCluster(a string) {
@@ -86,41 +93,51 @@ func handleMsg(con net.Conn) {
 		log.Println(err)
 		return
 	}
-	//log.Println(con.RemoteAddr(), "->", inMsg)
+
+	remoteNode := con.RemoteAddr().(*net.TCPAddr)
+	remoteNode.Port = int(inMsg.ListenPort)
+	config.Lock()
+	if n, ok := config.nodes[remoteNode.String()]; ok && !n.Up {
+		n.Up = true
+		config.nodes[remoteNode.String()] = n
+		log.Println(remoteNode, "is back online")
+	}
+	config.Unlock()
+	go syncNode(remoteNode)
+
 	switch inMsg.Typ {
 	case msgPing:
-		remoteNode := con.RemoteAddr().(*net.TCPAddr)
-		remoteNode.Port = int(inMsg.ListenPort)
-		config.Lock()
-		if n, ok := config.nodes[remoteNode.String()]; ok && !n.Up {
-			n.Up = true
-			config.nodes[remoteNode.String()] = n
-			log.Println(remoteNode, "is back online")
+		outMsg.Data = cpNodes()
+		outMsg.Typ = msgOK
+	case msgExec:
+		cmdStr := strings.Fields(inMsg.Data.(string))
+		var cmd *exec.Cmd
+		if len(cmdStr) > 1 {
+			cmd = exec.Command(cmdStr[0], cmdStr[1:]...)
+		} else {
+			cmd = exec.Command(cmdStr[0])
 		}
-		config.Unlock()
-		go syncNode(remoteNode)
-		outData := make(map[string]node)
-		config.RLock()
-		for k, v := range config.nodes {
-			outData[k] = v
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			outMsg.Data = err.Error()
+		} else {
+			outMsg.Data = string(output)
 		}
-		config.RUnlock()
-		outMsg.Data = outData
 		outMsg.Typ = msgOK
 	default:
 		log.Println("received unknown message", inMsg)
 		outMsg.Typ = msgErr
 		outMsg.Data = "unknown message type"
 	}
-	//log.Println(con.RemoteAddr(), "<-", outMsg)
 	err = enc.Encode(outMsg)
 	if err != nil {
 		log.Println(err)
 	}
 }
 
-func sendMsg(to *net.TCPAddr, m message) (*message, error) {
-	con, err := net.DialTCP("tcp", nil, to)
+func sendMsg(m message) (*message, error) {
+	m.ListenPort = int32(*listenPort)
+	con, err := net.DialTCP("tcp", nil, m.remote)
 	if err != nil {
 		return nil, err
 	}
@@ -132,7 +149,7 @@ func sendMsg(to *net.TCPAddr, m message) (*message, error) {
 	if err != nil {
 		return nil, err
 	}
-	resp := &message{}
+	resp := &message{remote: m.remote}
 	err = dec.Decode(resp)
 	if err != nil {
 		return nil, err
@@ -141,8 +158,24 @@ func sendMsg(to *net.TCPAddr, m message) (*message, error) {
 }
 
 func ping(addr *net.TCPAddr) {
+	// check if not adding ourselves
+	if addr.Port == *listenPort {
+		addrs, err := net.InterfaceAddrs()
+		if err != nil {
+			log.Println(err)
+			exit <- struct{}{}
+			return
+		}
+		for _, laddr := range addrs {
+			if lipaddr, ok := laddr.(*net.IPNet); ok {
+				if lipaddr.IP.Equal(addr.IP) {
+					return
+				}
+			}
+		}
+	}
 	for {
-		resp, err := sendMsg(addr, message{Typ: msgPing, ListenPort: int32(*listenPort)})
+		resp, err := sendMsg(message{remote: addr, Typ: msgPing})
 		config.Lock()
 		n := config.nodes[addr.String()]
 		if err != nil {
@@ -165,7 +198,7 @@ func ping(addr *net.TCPAddr) {
 					go syncNode(newn.TCPAddr)
 				}
 			}
-			n.lastSeen = time.Now()
+			n.LastSeen = time.Now()
 			n.failedPings = 0
 			n.Up = true
 		}
@@ -176,22 +209,6 @@ func ping(addr *net.TCPAddr) {
 }
 
 func syncNode(addr *net.TCPAddr) {
-	// check if not adding ourselves
-	if addr.Port == *listenPort {
-		addrs, err := net.InterfaceAddrs()
-		if err != nil {
-			log.Println(err)
-			exit <- struct{}{}
-			return
-		}
-		for _, laddr := range addrs {
-			if lipaddr, ok := laddr.(*net.IPNet); ok {
-				if lipaddr.IP.Equal(addr.IP) {
-					return
-				}
-			}
-		}
-	}
 	config.Lock()
 	defer config.Unlock()
 	n, ok := config.nodes[addr.String()]
